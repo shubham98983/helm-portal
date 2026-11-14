@@ -1,0 +1,21 @@
+services:
+  helm:
+    build: .
+    ports:
+      - "127.0.0.1:8100:8100"
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      COPILOT_URL: ${COPILOT_URL:-}
+      HELM_PORT: 8100
+      HELM_POLL_SECONDS: ${HELM_POLL_SECONDS:-120}
+      DATA_DIR: /data
+      HELM_HTTPS: ${HELM_HTTPS:-0}
+      HELM_ALLOW_ANONYMOUS: ${HELM_ALLOW_ANONYMOUS:-0}
+    volumes:
+      - helm-data:/data
+      - ./config/project.toml:/app/config/project.toml:ro
+      - ./config/team.toml:/app/config/team.toml:ro
+    restart: unless-stopped
+
+volumes:
+  helm-data:

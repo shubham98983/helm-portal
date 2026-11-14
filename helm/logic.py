@@ -200,3 +200,95 @@ def event_key(repo: str, kind: str, subject: str, occurred_at: str, actor: str =
     """Stable opaque key for idempotently storing a source event."""
     raw = "\0".join((repo.casefold(), kind.casefold(), str(subject), occurred_at, actor.casefold()))
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def issue_column(issue: dict[str, Any]) -> str:
+    """Map GitHub issues into the project work board."""
+    labels = {str(label.get("name", "")).casefold() for label in issue.get("labels", [])}
+    for label, column in (
+        ("status:todo", "todo"),
+        ("status:in-progress", "in-progress"),
+        ("status:review", "review"),
+        ("status:done", "done"),
+    ):
+        if label in labels:
+            return column
+    return "done" if issue.get("state") == "closed" else "backlog"
+
+
+def attention_items(
+    records: list[dict[str, Any]],
+    main_ci: dict[str, Any] | None = None,
+    audit_rows: list[dict[str, Any]] | None = None,
+    workloads: list[dict[str, Any]] | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Build actionable attention entries from normalized PR, CI, audit, and workload data."""
+    now = now or datetime.now(timezone.utc)
+    items: list[dict[str, Any]] = []
+    if main_ci and main_ci.get("conclusion") in FAILING_CHECKS:
+        items.append(
+            {
+                "kind": "main_ci",
+                "title": "Main branch CI is failing",
+                "detail": main_ci.get("name", "Latest workflow run failed"),
+                "url": main_ci.get("html_url", ""),
+            }
+        )
+    for record in records:
+        pull = record["pull"]
+        number = pull.get("number")
+        link = pull.get("html_url", "")
+        label = f"PR #{number}"
+        if record.get("is_ai") and record.get("checks", {}).get("overall") == "failing":
+            items.append(
+                {
+                    "kind": "ai_ci",
+                    "title": f"AI PR #{number} has failing checks",
+                    "detail": pull.get("title", ""),
+                    "url": link,
+                }
+            )
+        approvals = record.get("approvals", {})
+        if approvals.get("stale_by"):
+            items.append(
+                {
+                    "kind": "stale_approval",
+                    "title": f"{label} has stale approval after a push",
+                    "detail": ", ".join(approvals["stale_by"]),
+                    "url": link,
+                }
+            )
+        created = _timestamp(pull.get("created_at"))
+        if pull.get("state") == "open" and approvals.get("missing") and now - created > timedelta(days=3):
+            blockers = approvals["missing"] + approvals.get("changes_requested_by", [])
+            items.append(
+                {
+                    "kind": "awaiting_approval",
+                    "title": f"{label} awaits approval for over 3 days",
+                    "detail": f"Waiting on {', '.join(dict.fromkeys(blockers)) or 'reviewers'}",
+                    "url": link,
+                }
+            )
+    for row in audit_rows or []:
+        if row.get("verdict") == "violation":
+            items.append(
+                {
+                    "kind": "audit_violation",
+                    "title": f"Merged AI PR #{row.get('number')} violated policy",
+                    "detail": "; ".join(row.get("reasons", [])),
+                    "url": row.get("url", ""),
+                }
+            )
+    for workload in workloads or []:
+        if workload.get("reviews_pending", 0) > 3:
+            reviewer = workload.get("name", workload.get("github"))
+            items.append(
+                {
+                    "kind": "review_backlog",
+                    "title": f"{reviewer} has {workload['reviews_pending']} pending reviews",
+                    "detail": "Reviewer workload is above three pending PRs",
+                    "url": "#/team",
+                }
+            )
+    return items

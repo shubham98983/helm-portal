@@ -42,6 +42,11 @@ class SyncService:
     def repos(self) -> list[str]:
         return [item["full_name"] for item in self.project.get("repo", []) if item.get("full_name")]
 
+    @property
+    def is_running(self) -> bool:
+        with self._repo_lock_guard:
+            return any(lock.locked() for lock in self._repo_locks.values())
+
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return

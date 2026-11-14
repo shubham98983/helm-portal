@@ -109,6 +109,7 @@ function memberNode(member) {
 async function renderTeam(content) {
   const data = await api('/api/team'), tree = el('ul', undefined, 'tree root');
   (data.tree || []).forEach((member) => tree.append(memberNode(member)));
+  if (!data.tree?.length) content.append(el('p', 'No team members are configured yet.', 'empty-state'));
   content.append(tree);
   const section = el('section', undefined, 'section');
   section.append(el('h2', 'AI contributors'));
@@ -119,6 +120,7 @@ async function renderTeam(content) {
       el('strong', 'May not'), list(agent.may_not));
     grid.append(item);
   });
+  if (!data.ai_agents?.length) grid.append(el('p', 'No AI contributors are configured.', 'empty-state'));
   section.append(grid); content.append(section);
 }
 
@@ -139,6 +141,7 @@ async function renderProject(content) {
     if (repo.metadata_error) item.append(el('p', repo.metadata_error, 'muted'));
     repos.append(item);
   });
+  if (!data.repos?.length) repos.append(el('p', 'No repositories are configured.', 'empty-state'));
   content.append(section('Repositories', repos));
   const env = el('div', undefined, 'grid');
   (project.environment || []).forEach((item) => {
@@ -151,6 +154,7 @@ async function renderProject(content) {
     row.append(el('span', undefined, 'dot'), el('div', `${item.name}${item.due ? ` · ${item.due}` : ''}`), el('span', item.status, 'tag'));
     row.children[1].append(list(item.deliverables)); timeline.append(row);
   });
+  if (!data.milestones?.length) timeline.append(el('p', 'No milestones are configured.', 'empty-state'));
   content.append(section('Milestones', timeline));
   for (const [title, items] of [
     ['Policies', Object.entries(project.policies || {}).map(([key, value]) => `${key.replaceAll('_', ' ')}: ${value}`)],
@@ -240,6 +244,114 @@ async function renderBoard(content, me) {
 
 const eventIcon = { pull_request: '↗', review: '◉', check: '✓', workflow: '⚙', commit: '⌘' };
 
+function ageLabel(value) {
+  if (!value) return 'Age unavailable';
+  const days = Math.max(0, Math.floor((Date.now() - Date.parse(value)) / 86400000));
+  return days ? `${days}d old` : 'Today';
+}
+
+async function renderWork(content) {
+  const project = await api('/api/project');
+  const controls = el('div', undefined, 'filters');
+  const boardRoot = el('div', undefined, 'board work-board');
+  const assignees = document.createElement('select'); assignees.setAttribute('aria-label', 'Assignee');
+  const labelSelect = document.createElement('select'); labelSelect.setAttribute('aria-label', 'Label');
+  let repo = '', assignee = '', labelValue = '';
+  const refresh = async () => {
+    const query = new URLSearchParams();
+    if (repo) query.set('repo', repo);
+    if (assignee) query.set('assignee', assignee);
+    if (labelValue) query.set('label', labelValue);
+    const data = await api(`/api/work/issues?${query}`);
+    boardRoot.replaceChildren();
+    const assigneeOptions = [...new Set(data.issues.flatMap((issue) => issue.assignees))].sort();
+    const labelOptions = [...new Set(data.issues.flatMap((issue) => issue.labels))].sort();
+    assignees.replaceChildren();
+    [['', 'All assignees'], ...assigneeOptions.map((name) => [name, name])].forEach(([value, text]) => {
+      const option = document.createElement('option'); option.value = value; option.textContent = text; assignees.append(option);
+    });
+    assignees.value = assignee;
+    labelSelect.replaceChildren();
+    [['', 'All labels'], ...labelOptions.map((name) => [name, name])].forEach(([value, text]) => {
+      const option = document.createElement('option'); option.value = value; option.textContent = text; labelSelect.append(option);
+    });
+    labelSelect.value = labelValue;
+    Object.entries(data.errors || {}).forEach(([name, message]) => content.prepend(el('p', `${name}: ${message}`, 'error-banner')));
+    const columns = [['backlog', 'Backlog'], ['todo', 'To do'], ['in-progress', 'In progress'],
+      ['review', 'Review'], ['done', 'Done']];
+    columns.forEach(([key, title]) => {
+      const sectionNode = el('section', undefined, 'board-column');
+      const items = data.issues.filter((issue) => issue.column === key);
+      sectionNode.append(el('h2', title), el('span', String(items.length), 'column-count'));
+      if (!items.length) sectionNode.append(el('p', 'Nothing here yet', 'muted'));
+      items.forEach((issue) => {
+        const item = el('article', undefined, 'card issue-card');
+        const heading = el('h3'); heading.append(safeGitHubLink(issue.url, `#${issue.number} ${issue.title}`));
+        item.append(heading, el('p', issue.repo, 'muted'));
+        const people = el('div', undefined, 'assignees');
+        issue.assignees.forEach((name) => people.append(el('span', initials(name), 'avatar-initials')));
+        if (!issue.assignees.length) people.append(el('span', 'Unassigned', 'muted'));
+        item.append(people);
+        const tags = el('div', undefined, 'issue-labels');
+        issue.labels.forEach((value) => tags.append(el('span', value, 'tag')));
+        item.append(tags, el('p', ageLabel(issue.created_at), 'muted'));
+        if (issue.linked_pr) {
+          const link = safeGitHubLink(`https://github.com/${issue.repo}/pull/${issue.linked_pr}`, `Linked PR #${issue.linked_pr}`);
+          item.append(link);
+        }
+        sectionNode.append(item);
+      });
+      boardRoot.append(sectionNode);
+    });
+  };
+  assignees.addEventListener('change', () => { assignee = assignees.value; refresh(); });
+  labelSelect.addEventListener('change', () => { labelValue = labelSelect.value; refresh(); });
+  controls.append(repoSelector(project.repos || [], repo, (value) => { repo = value; refresh(); }), assignees,
+    labelSelect);
+  content.append(controls, boardRoot);
+  await refresh();
+}
+
+function initials(name) {
+  return String(name || '?').split(/[-_\s]+/).filter(Boolean).slice(0, 2).map((part) => part[0].toUpperCase()).join('');
+}
+
+async function renderHome(content) {
+  const data = await api('/api/overview');
+  const grid = el('div', undefined, 'overview-grid');
+  const ci = data.main_ci;
+  const tiles = [
+    ['Main branch CI', ci ? `${ci.conclusion || ci.status} · ${ci.age || ''}` : 'No data', ci?.html_url],
+    ['Open pull requests', `${data.open_prs.ai} AI · ${data.open_prs.human} human`, '#/pull-requests'],
+    ['Awaiting approval', String(data.awaiting_approval), '#/pull-requests'],
+    ['AI changes this week', `${data.ai_changes_this_week.opened} opened · ${data.ai_changes_this_week.merged} merged`, '#/audit'],
+    ['Open issues', String(data.open_issues), '#/work'],
+  ];
+  if (data.copilot) {
+    const quality = data.copilot.status === 'unavailable' ? data.copilot.label
+      : `Score ${data.copilot.score} · coverage ${data.copilot.coverage} · ${Object.entries(data.copilot.findings || {}).map(([severity, count]) => `${severity}: ${count}`).join(', ') || 'no findings'} · trend ${(data.copilot.score_trend || []).join(' → ') || 'No data'}`;
+    tiles.push(['Copilot quality', quality, '#/project']);
+  }
+  tiles.forEach(([title, value, url]) => {
+    const item = card(title, el('p', value, 'tile-value'));
+    if (url?.startsWith('https://github.com/')) item.append(safeGitHubLink(url, 'Open source'));
+    else if (url?.startsWith('#/')) { const link = el('a', 'Open details'); link.href = url; item.append(link); }
+    grid.append(item);
+  });
+  content.append(grid);
+  const listRoot = el('div', undefined, 'attention-list');
+  if (!data.needs_attention.length) listRoot.append(el('p', 'No items need attention right now.', 'empty-state'));
+  data.needs_attention.forEach((item) => {
+    const row = el('article', undefined, 'attention-item');
+    row.append(el('strong', item.title), el('p', item.detail, 'muted'));
+    if (item.url?.startsWith('#/')) { const a = el('a', 'Open page'); a.href = item.url; row.append(a); }
+    else if (item.url) row.append(safeGitHubLink(item.url, 'Open on GitHub'));
+    listRoot.append(row);
+  });
+  content.append(section('Needs attention', listRoot));
+  Object.entries(data.errors || {}).forEach(([repo, message]) => content.prepend(el('p', `${repo}: ${message}`, 'error-banner')));
+}
+
 async function renderActivity(content) {
   const project = await api('/api/project'), filter = el('div', undefined, 'filters');
   let repo = '', actor = 'all', kind = '', before = '';
@@ -264,6 +376,7 @@ async function renderActivity(content) {
       if (event.url) detail.append(safeGitHubLink(event.url, 'View on GitHub'));
       row.append(detail); feed.append(row);
     });
+    if (reset && !data.events.length) feed.append(el('p', 'No activity matches these filters yet.', 'empty-state'));
     before = data.next_before || '';
     load.hidden = !before;
   };
@@ -304,6 +417,10 @@ async function renderAudit(content) {
       item.reviews.forEach((review) => details.append(el('p', `${review.user?.login || 'Unknown'} · ${review.state} · ${review.submitted_at || 'timestamp unavailable'}`)));
       detailsCell.append(details); row.append(detailsCell); body.append(row);
     });
+    if (!data.entries.length) {
+      const row = document.createElement('tr'), cell = el('td', 'No audit entries yet.', 'empty-state');
+      cell.colSpan = 5; row.append(cell); body.append(row);
+    }
   };
   controls.append(repoSelector(project.repos || [], repo, (value) => { repo = value; refresh(); }));
   const verdictSelect = document.createElement('select'); verdictSelect.setAttribute('aria-label', 'Verdict');
@@ -323,7 +440,9 @@ async function render() {
   const visiblePages = pages.filter(([id]) => id !== 'audit' || ['lead', 'reviewer'].includes(me.role));
   if (key === 'audit' && !visiblePages.some(([id]) => id === key)) { location.hash = '#/home'; return; }
   const shell = el('div', undefined, 'shell'), nav = el('aside', undefined, 'sidebar');
+  const skip = el('a', 'Skip to content', 'skip-link'); skip.href = '#main-content'; nav.append(skip);
   nav.append(el('div', 'HELM', 'brand'));
+  nav.setAttribute('aria-label', 'Main navigation');
   visiblePages.forEach(([id, title]) => {
     const link = el('a', title, `nav-link${id === key ? ' active' : ''}`); link.href = `#/${id}`; nav.append(link);
   });
@@ -334,9 +453,12 @@ async function render() {
   nav.append(signOut);
   const main = el('div', undefined, 'main'), top = el('header', undefined, 'topbar');
   top.append(el('strong', key === 'team' ? 'People & ownership' : key === 'project' ? 'Project profile' : pages.find((page) => page[0] === key)?.[1] || 'Helm'));
-  const identity = el('div', undefined, 'identity'); identity.append(el('strong', me.name), el('span', me.role)); top.append(identity);
+  const identity = el('div', undefined, 'identity'); identity.append(el('strong', me.name), el('span', me.role));
+  const lastSynced = el('span', 'Last synced: loading', 'last-synced'); identity.append(lastSynced); top.append(identity);
   main.append(top);
-  const content = el('main', undefined, 'content'), pageHead = el('div', undefined, 'page-head');
+  const content = el('main', undefined, 'content'); content.id = 'main-content'; content.setAttribute('tabindex', '-1');
+  content.setAttribute('aria-busy', 'true');
+  const pageHead = el('div', undefined, 'page-head');
   const heading = key === 'pull-requests' ? 'Pull requests' : key === 'audit' ? 'AI audit ledger' : pages.find((page) => page[0] === key)?.[1] || 'Home';
   const titleBlock = el('div'); titleBlock.append(el('h1', heading), el('p', 'A clear view of project delivery.', 'muted'));
   pageHead.append(titleBlock); content.append(pageHead);
@@ -346,10 +468,19 @@ async function render() {
     else if (key === 'pull-requests') await renderBoard(content, me);
     else if (key === 'activity') await renderActivity(content);
     else if (key === 'audit') await renderAudit(content);
-    else if (key === 'home') content.append(el('div', 'Project command center', 'placeholder'));
+    else if (key === 'home') await renderHome(content);
+    else if (key === 'work') await renderWork(content);
     else content.append(el('div', `${pages.find((page) => page[0] === key)?.[1] || 'Page'} coming next`, 'placeholder'));
   } catch (error) { content.append(el('p', error.message, 'error-banner')); }
+  content.setAttribute('aria-busy', 'false');
   main.append(content); shell.append(nav, main); app.replaceChildren(shell);
+  api('/api/status').then((status) => {
+    const date = status.last_synced ? new Date(status.last_synced * 1000).toLocaleString() : 'Not synced yet';
+    lastSynced.textContent = `Last synced: ${date}${status.syncing ? ' · Sync in progress' : ''}`;
+    const notices = el('div', undefined, 'global-notices');
+    (status.notices || []).forEach((notice) => notices.append(el('p', notice, 'error-banner')));
+    content.prepend(notices);
+  }).catch(() => { lastSynced.textContent = 'Last synced: unavailable'; });
 }
 
 window.addEventListener('hashchange', render);

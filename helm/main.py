@@ -7,8 +7,11 @@ import io
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,11 +22,13 @@ from helm.config import ConfigError, load_config
 from helm.github import GitHubClient, GitHubError
 from helm.logic import (
     approval_summary,
+    attention_items,
     audit_verdict,
     board_column,
     check_summary,
     detect_ai_pr,
     is_bot_author,
+    issue_column,
     required_approvers,
 )
 from helm.store import Store
@@ -238,6 +243,202 @@ def create_app(
             "milestone_progress": round(done / len(milestones) * 100) if milestones else 0,
         }
 
+    def _sync_status() -> dict:
+        with app.state.store.connect() as db:
+            rows = db.execute(
+                "SELECT repo,last_sync,last_error,request_count FROM sync_meta ORDER BY repo"
+            ).fetchall()
+        notices = []
+        if not app.state.github.token and app.state.sync_service.repos:
+            notices.append("GitHub token is not configured; showing locally cached data only.")
+        notices.extend(f"{row['repo']}: {row['last_error']}" for row in rows if row["last_error"])
+        syncing = app.state.sync_service.is_running
+        if syncing:
+            notices.append("A GitHub sync is in progress.")
+        return {
+            "repos": [dict(row) for row in rows],
+            "last_synced": max((row["last_sync"] for row in rows if row["last_sync"]), default=None),
+            "syncing": syncing,
+            "notices": notices,
+        }
+
+    @app.get("/api/status")
+    async def status():
+        return _sync_status()
+
+    @app.get("/api/work/issues")
+    async def work_issues(repo: str | None = None, assignee: str | None = None, label: str | None = None):
+        repo_names = _repo_names(repo)
+        if repo and not repo_names:
+            raise HTTPException(404, "Repository is not configured")
+        issues, errors = [], {}
+        for repository in repo_names:
+            try:
+                rows = app.state.github.issues(repository)
+            except GitHubError as exc:
+                errors[repository] = str(exc)
+                continue
+            with app.state.store.connect() as db:
+                pulls = db.execute("SELECT number,payload FROM prs WHERE repo=?", (repository,)).fetchall()
+            references = []
+            for row in pulls:
+                pull = json.loads(row["payload"])
+                references.append((int(row["number"]), str(pull.get("body") or "")))
+            for issue in rows:
+                if issue.get("state") == "closed":
+                    try:
+                        closed = datetime.fromisoformat(issue.get("closed_at", "").replace("Z", "+00:00"))
+                        if closed.tzinfo is None:
+                            closed = closed.replace(tzinfo=timezone.utc)
+                        if datetime.now(timezone.utc) - closed > timedelta(days=14):
+                            continue
+                    except ValueError:
+                        continue
+                assigned = [item.get("login", "") for item in issue.get("assignees", [])]
+                labels = [item.get("name", "") for item in issue.get("labels", [])]
+                if assignee and assignee.casefold() not in {value.casefold() for value in assigned}:
+                    continue
+                if label and label.casefold() not in {value.casefold() for value in labels}:
+                    continue
+                linked = next(
+                    (number for number, body in references if f"#{issue.get('number')}" in body), None
+                )
+                issues.append(
+                    {
+                        "number": issue.get("number"),
+                        "repo": repository,
+                        "title": issue.get("title", ""),
+                        "state": issue.get("state", "open"),
+                        "column": issue_column(issue),
+                        "url": issue.get("html_url", ""),
+                        "created_at": issue.get("created_at"),
+                        "updated_at": issue.get("updated_at"),
+                        "assignees": assigned,
+                        "labels": labels,
+                        "linked_pr": linked,
+                    }
+                )
+        issues.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+        return {"issues": issues, "errors": errors, "last_synced": _sync_status()["last_synced"]}
+
+    @app.get("/api/overview")
+    async def overview():
+        repos = app.state.sync_service.repos
+        records = _records(repos)
+        now = datetime.now(timezone.utc)
+        monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        open_records = [record for record in records if record["pull"].get("state") == "open"]
+        opened_this_week = merged_this_week = 0
+        for record in records:
+            pull = record["pull"]
+            created = pull.get("created_at") or ""
+            merged = pull.get("merged_at") or ""
+            if record["is_ai"] and created and created >= monday.isoformat():
+                opened_this_week += 1
+            if record["is_ai"] and merged and merged >= monday.isoformat():
+                merged_this_week += 1
+
+        main_ci = None
+        ci_errors = {}
+        issues_open = 0
+        latest_runs = []
+        for repository in repos:
+            try:
+                metadata = app.state.github.repo_metadata(repository)
+                branch = metadata.get("default_branch") or "main"
+                runs = app.state.github.workflow_runs(repository)
+                matches = [run for run in runs if run.get("head_branch") == branch]
+                if matches:
+                    latest_runs.append((matches[0], repository))
+            except GitHubError as exc:
+                ci_errors[repository] = str(exc)
+            try:
+                issues_open += sum(
+                    item.get("state") == "open" for item in app.state.github.issues(repository)
+                )
+            except GitHubError as exc:
+                ci_errors.setdefault(repository, str(exc))
+        if latest_runs:
+            primary_repo = repos[0] if repos else ""
+            primary_runs = [pair for pair in latest_runs if pair[1] == primary_repo]
+            run, repository = max(primary_runs or latest_runs, key=lambda pair: pair[0].get("updated_at", ""))
+            main_ci = {
+                "repo": repository,
+                "name": run.get("name", "Workflow"),
+                "status": run.get("status"),
+                "conclusion": run.get("conclusion"),
+                "updated_at": run.get("updated_at"),
+                "html_url": run.get("html_url"),
+                "age": _age(run.get("updated_at")),
+            }
+
+        copilot = None
+        copilot_url = os.getenv("COPILOT_URL", "").rstrip("/")
+        if copilot_url:
+            try:
+                if not repos:
+                    raise ValueError("No repository is configured")
+                response = httpx.get(
+                    f"{copilot_url}/api/repos/{quote(repos[0], safe='')}/pipeline/summary", timeout=3.0
+                )
+                response.raise_for_status()
+                raw = response.json()
+                score = raw.get("quality_score", raw.get("score"))
+                coverage = raw.get("coverage")
+                findings = raw.get("findings", {})
+                if isinstance(findings, list):
+                    finding_counts = {}
+                    for finding in findings:
+                        severity = str(finding.get("severity", "unknown")).casefold()
+                        finding_counts[severity] = finding_counts.get(severity, 0) + 1
+                    findings = finding_counts
+                copilot = {
+                    "status": "available",
+                    "score": score if score is not None else "No data",
+                    "coverage": coverage if coverage is not None else "No data",
+                    "findings": findings,
+                    "score_trend": raw.get("score_trend", raw.get("trend", [])),
+                }
+            except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                copilot = {"status": "unavailable", "label": "Copilot unavailable"}
+
+        workloads = [
+            {"github": member["github"], "name": member["name"], **_member_workload(member["github"])}
+            for member in app.state.team.get("member", [])
+        ]
+        attention = attention_items(records, main_ci, _audit_rows(None, "violation"), workloads, now)
+        awaiting = sum(bool(record["approvals"].get("missing")) for record in open_records)
+        return {
+            "main_ci": main_ci,
+            "open_prs": {
+                "ai": sum(r["is_ai"] for r in open_records),
+                "human": sum(not r["is_ai"] for r in open_records),
+            },
+            "awaiting_approval": awaiting,
+            "ai_changes_this_week": {"opened": opened_this_week, "merged": merged_this_week},
+            "open_issues": issues_open,
+            "copilot": copilot,
+            "needs_attention": attention,
+            "errors": ci_errors,
+            "last_synced": _sync_status()["last_synced"],
+        }
+
+    def _age(value: str | None) -> str | None:
+        if not value:
+            return None
+        try:
+            occurred = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if occurred.tzinfo is None:
+                occurred = occurred.replace(tzinfo=timezone.utc)
+            seconds = max(0, int((datetime.now(timezone.utc) - occurred).total_seconds()))
+            if seconds < 3600:
+                return f"{max(1, seconds // 60)}m ago"
+            if seconds < 86400:
+                return f"{seconds // 3600}h ago"
+            return f"{seconds // 86400}d ago"
+        except ValueError:
+            return None
+
     @app.post("/api/sync")
     async def sync_now(payload: SyncRequest, request: Request):
         if "application/json" not in request.headers.get("content-type", ""):
@@ -388,6 +589,44 @@ def create_app(
             }
             for row in rows
         ]
+        copilot_url = os.getenv("COPILOT_URL", "").rstrip("/")
+        if copilot_url and (actor in {"all", "ai"}) and kind in {None, "copilot_failure"}:
+            for repository in repo_names:
+                try:
+                    response = httpx.get(
+                        f"{copilot_url}/api/repos/{quote(repository, safe='')}/runs", timeout=3.0
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    runs = payload if isinstance(payload, list) else payload.get("runs", [])
+                    for run in runs:
+                        if str(run.get("status", run.get("conclusion", ""))).casefold() not in {
+                            "failure",
+                            "failed",
+                            "error",
+                        } and str(run.get("conclusion", "")).casefold() not in {"failure", "failed", "error"}:
+                            continue
+                        occurred = run.get("created_at", run.get("updated_at", ""))
+                        if before and occurred >= before:
+                            continue
+                        events.append(
+                            {
+                                "repo": repository,
+                                "key": f"copilot:{run.get('id', '')}",
+                                "kind": "copilot_failure",
+                                "actor": "AI DevOps Copilot",
+                                "actor_type": "ai",
+                                "is_ai": True,
+                                "created_at": run.get("created_at", run.get("updated_at", "")),
+                                "name": run.get("name", "Failure analysis"),
+                                "message": run.get("summary", run.get("analysis", "Failed run analysis")),
+                                "url": run.get("html_url", ""),
+                            }
+                        )
+                except (httpx.HTTPError, ValueError, TypeError):
+                    continue
+        events.sort(key=lambda event: event.get("created_at", ""), reverse=True)
+        events = events[:limit]
         return {"events": events, "next_before": events[-1]["created_at"] if has_more and events else None}
 
     def _audit_rows(repo: str | None, verdict: str | None):

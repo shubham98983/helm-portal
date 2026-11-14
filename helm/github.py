@@ -78,7 +78,10 @@ class GitHubClient:
         if cached and cached["etag"]:
             headers["If-None-Match"] = cached["etag"]
         self._record_request()
-        response = self.client.get(url, headers=headers)
+        try:
+            response = self.client.get(url, headers=headers)
+        except httpx.HTTPError as exc:
+            raise GitHubError(f"GitHub request failed ({type(exc).__name__}).") from exc
         if response.status_code == 304 and cached:
             with self.store.connect() as db:
                 db.execute("UPDATE http_cache SET updated=? WHERE url=?", (time.time(), url))
@@ -144,6 +147,14 @@ class GitHubClient:
     def workflow_runs(self, repo: str) -> list[dict]:
         data = self.get(f"{self._repo_path(repo)}/actions/runs?per_page=100")
         return data.get("workflow_runs", [])
+
+    def issues(self, repo: str) -> list[dict]:
+        """List recent open and closed issues, filtering pull requests from GitHub's shared endpoint."""
+        data = self.get(
+            f"{self._repo_path(repo)}/issues?state=all&sort=updated&direction=desc&per_page=100",
+            fresh_for=600,
+        )
+        return [item for item in data if "pull_request" not in item]
 
     def branch_commits(self, repo: str, branch: str) -> list[dict]:
         from urllib.parse import quote

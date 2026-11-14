@@ -88,3 +88,25 @@ def test_request_budget_is_capped_per_sync(tmp_path):
     with pytest.raises(RequestBudgetExceeded, match="Per-sync"):
         client.get("repos/org/two")
     assert len(calls) == 1
+
+
+def test_issues_excludes_pull_requests_and_caches_response(tmp_path):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        assert request.method == "GET"
+        assert request.url.path.endswith("/issues")
+        return httpx.Response(
+            200,
+            headers={"ETag": '"issues"'},
+            json=[
+                {"number": 1, "title": "Issue"},
+                {"number": 2, "title": "Pull", "pull_request": {"url": "x"}},
+            ],
+        )
+
+    client = GitHubClient(Store(str(tmp_path)), "token", httpx.MockTransport(handler))
+    assert [issue["number"] for issue in client.issues("org/repo")] == [1]
+    assert [issue["number"] for issue in client.issues("org/repo")] == [1]
+    assert len(calls) == 1

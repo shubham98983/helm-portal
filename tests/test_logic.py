@@ -2,12 +2,14 @@ from datetime import datetime, timedelta, timezone
 
 from helm.logic import (
     approval_summary,
+    attention_items,
     audit_verdict,
     board_column,
     check_summary,
     detect_ai_pr,
     event_key,
     is_bot_author,
+    issue_column,
     required_approvers,
     review_states,
 )
@@ -133,3 +135,67 @@ def test_event_key_is_stable_and_scoped():
     key = event_key("Org/Repo", "review", "123", "2025-01-01T00:00:00Z", "Alice")
     assert key == event_key("org/repo", "REVIEW", "123", "2025-01-01T00:00:00Z", "alice")
     assert key != event_key("org/other", "review", "123", "2025-01-01T00:00:00Z", "alice")
+
+
+def test_issue_board_status_label_mapping_and_fallbacks():
+    assert issue_column({"state": "open", "labels": [{"name": "status:todo"}]}) == "todo"
+    assert issue_column({"state": "open", "labels": [{"name": "status:in-progress"}]}) == "in-progress"
+    assert issue_column({"state": "open", "labels": [{"name": "STATUS:REVIEW"}]}) == "review"
+    assert issue_column({"state": "open", "labels": [{"name": "status:done"}]}) == "done"
+    assert issue_column({"state": "open", "labels": [{"name": "bug"}]}) == "backlog"
+    assert issue_column({"state": "closed", "labels": []}) == "done"
+
+
+def test_attention_rules_cover_ci_approvals_audit_and_review_load():
+    now = datetime.now(timezone.utc)
+    pr = {
+        **pull(),
+        "number": 41,
+        "created_at": (now - timedelta(days=4)).isoformat(),
+        "html_url": "https://github.com/o/r/pull/41",
+        "title": "AI work",
+    }
+    record = {
+        "pull": pr,
+        "is_ai": True,
+        "checks": {"overall": "failing"},
+        "approvals": {"missing": ["bob"], "stale_by": ["alice"], "changes_requested_by": ["carol"]},
+    }
+    items = attention_items(
+        [record],
+        {"conclusion": "failure", "name": "CI", "html_url": "https://github.com/o/r/actions/1"},
+        [
+            {
+                "number": 32,
+                "verdict": "violation",
+                "reasons": ["missing approval"],
+                "url": "https://github.com/o/r/pull/32",
+            }
+        ],
+        [{"github": "reviewer", "name": "Reviewer", "reviews_pending": 4}],
+        now,
+    )
+    kinds = {item["kind"] for item in items}
+    assert kinds == {
+        "main_ci",
+        "ai_ci",
+        "awaiting_approval",
+        "stale_approval",
+        "audit_violation",
+        "review_backlog",
+    }
+    awaiting = next(item for item in items if item["kind"] == "awaiting_approval")
+    assert "bob" in awaiting["detail"] and "carol" in awaiting["detail"]
+    assert "alice" in next(item for item in items if item["kind"] == "stale_approval")["detail"]
+
+
+def test_attention_ignores_fresh_or_non_ai_healthy_pulls():
+    now = datetime.now(timezone.utc)
+    pr = {**pull(), "number": 1, "created_at": now.isoformat()}
+    record = {
+        "pull": pr,
+        "is_ai": False,
+        "checks": {"overall": "passing"},
+        "approvals": {"missing": [], "stale_by": [], "changes_requested_by": []},
+    }
+    assert attention_items([record], now=now) == []

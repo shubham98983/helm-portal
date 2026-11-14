@@ -39,8 +39,30 @@ window.fetch = async (url) => {
     };
   }
   if (url === '/api/project') {
-    return { ok: true, json: async () => ({ repos: [{ full_name: 'org/repo' }] }) };
+    return { ok: true, json: async () => ({
+      profile: { name: 'Helm', tagline: 'Tag', purpose: 'Purpose', phase: 'Build', tech_stack: [],
+        policies: {}, environment: [], runbook: [], links: [] },
+      repos: [{ full_name: 'org/repo', role: 'Primary' }], milestones: [], milestone_progress: 0,
+    }) };
   }
+  if (url === '/api/overview') return { ok: true, json: async () => ({
+    main_ci: { conclusion: 'success', age: '1h ago', html_url: 'javascript:alert(1)' },
+    open_prs: { ai: 1, human: 2 }, awaiting_approval: 1,
+    ai_changes_this_week: { opened: 1, merged: 0 }, open_issues: 1, copilot: null,
+    needs_attention: [{ title: 'Review needed', detail: 'Waiting on bob', url: 'https://github.com/org/repo/pull/4' }], errors: {},
+  }) };
+  if (url.startsWith('/api/work/issues')) return { ok: true, json: async () => ({
+    issues: [{ number: 8, repo: 'org/repo', title: '<img src=x onerror=alert(1)> Work item',
+      state: 'open', column: 'todo', url: 'javascript:alert(1)', created_at: '2026-11-14T00:00:00Z',
+      assignees: ['bob'], labels: ['status:todo'], linked_pr: 4 }], errors: {},
+  }) };
+  if (url.startsWith('/api/activity')) return { ok: true, json: async () => ({
+    events: [{ kind: 'copilot_failure', actor: 'AI DevOps Copilot', actor_type: 'ai', is_ai: true,
+      repo: 'org/repo', created_at: '2026-11-14', message: 'Failure summary', url: 'javascript:alert(1)' }],
+    next_before: null,
+  }) };
+  if (url.startsWith('/api/audit')) return { ok: true, json: async () => ({ entries: [] }) };
+  if (url === '/api/status') return { ok: true, json: async () => ({ last_synced: 0, syncing: false }) };
   if (url.startsWith('/api/prs/board')) {
     const empty = { draft: [], ci: [], awaiting: [], ready: [], done: [] };
     empty.ready.push({
@@ -80,6 +102,31 @@ async function run() {
   aiToggle.dispatchEvent(new window.Event('change', { bubbles: true }));
   await tick(); await tick();
   assert.ok(requests.some((url) => url.includes('ai=1')), 'AI-only filter reloads the board');
+  window.location.hash = '#/home';
+  await tick(); await tick();
+  assert.ok(window.document.querySelector('.overview-grid').textContent.includes('Open issues'));
+  assert.equal(window.document.querySelectorAll('a[href^="javascript:"]').length, 0);
+  window.location.hash = '#/work';
+  await tick(); await tick();
+  assert.ok(window.document.querySelector('.work-board').textContent.includes('To do'));
+  assert.equal(window.document.querySelectorAll('img').length, 0, 'issue title is rendered as text');
+  assert.equal(window.document.querySelectorAll('a[href^="javascript:"]').length, 0, 'issue URL is rejected');
+  const assigneeSelect = window.document.querySelector('select[aria-label="Assignee"]');
+  assigneeSelect.value = 'bob'; assigneeSelect.dispatchEvent(new window.Event('change', { bubbles: true }));
+  await tick(); await tick();
+  assert.ok(requests.some((url) => url.includes('assignee=bob')), 'assignee filter reloads issues');
+  window.location.hash = '#/activity';
+  await tick(); await tick();
+  assert.ok(window.document.querySelector('.activity-feed').textContent.includes('Failure summary'));
+  window.location.hash = '#/audit';
+  await tick(); await tick();
+  assert.ok(window.document.querySelector('table'));
+  window.location.hash = '#/project';
+  await tick(); await tick();
+  assert.ok(window.document.querySelector('h1').textContent.includes('Project'));
+  window.location.hash = '#/team';
+  await tick(); await tick();
+  assert.ok(window.document.querySelector('.member'));
   role = 'viewer';
   window.location.hash = '#/home';
   await tick();
