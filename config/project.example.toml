@@ -1,0 +1,34 @@
+name = "Helm Portal"
+tagline = "A clear view of how your project runs."
+purpose = "A read-only command center for project delivery, decisions, and AI contributions."
+phase = "Foundation"
+tech_stack = ["Python", "FastAPI", "SQLite", "Plain JavaScript"]
+
+[[repo]]
+full_name = "example/your-repository"
+role = "Primary application"
+url = "https://github.com/example/your-repository"
+
+[[environment]]
+name = "Development"
+url = "http://127.0.0.1:8100"
+notes = "Local development instance"
+
+[[milestone]]
+name = "Project foundation"
+due = ""
+status = "active"
+deliverables = ["Team and project pages", "Secure sign-in"]
+
+[policies]
+ai_usage = "AI contributions must be disclosed and reviewed by a human."
+approvals_required = "See repository approver policy."
+branch_rules = "Protect the default branch and require checks."
+
+[[links]]
+label = "Repository"
+url = "https://github.com/example/your-repository"
+
+[[runbook]]
+title = "Start Helm locally"
+steps = ["Create a virtual environment", "Install requirements-dev.txt", "Configure team.toml", "Run python -m helm"]

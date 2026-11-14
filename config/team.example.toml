@@ -1,0 +1,25 @@
+[[member]]
+github = "project-lead"
+name = "Project Lead"
+role = "lead"
+title = "Project lead"
+reports_to = ""
+responsibilities = ["Project direction", "Review and oversight"]
+password_hash = ""
+
+[[member]]
+github = "reviewer"
+name = "Reviewer"
+role = "reviewer"
+title = "Senior engineer"
+reports_to = "project-lead"
+responsibilities = ["Code review", "CI health"]
+password_hash = ""
+
+[[ai_agent]]
+id = "delivery-assistant"
+name = "Delivery Assistant"
+purpose = "Supports routine delivery work."
+supervised_by = "project-lead"
+may = ["Suggest code changes", "Summarize checks"]
+may_not = ["Approve or merge pull requests", "Write to GitHub"]
